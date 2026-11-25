@@ -91,6 +91,12 @@
       </button>
 
       <div class="flex items-center gap-2">
+        <!-- Live Connection Status & Diagnostic Button -->
+        <button id="btn-conn-status" type="button" title="Kiểm tra trạng thái kết nối máy chủ" class="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-amber-100 hover:bg-amber-200 text-amber-900 font-extrabold text-xs border border-amber-200 transition-all">
+          <span id="conn-dot" class="w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse"></span>
+          <span id="conn-label" class="hidden sm:inline">Đang kết nối...</span>
+        </button>
+
         <!-- Theme Switcher -->
         <div id="theme-switcher" class="hidden md:flex items-center bg-slate-100 rounded-xl p-1 border border-slate-200 gap-1">
           <button type="button" data-theme="classroom" title="Lớp học truyền thống" class="theme-btn px-2.5 py-1 rounded-lg text-sm font-bold transition-all bg-white shadow text-amber-900 scale-105">🏫</button>
@@ -152,29 +158,39 @@
     // 1. FIREBASE CONFIGURATION & SAFE INITIALIZATION
     // ========================================================================
     // Khi chạy trên Canvas Preview, hệ thống tự động cung cấp __firebase_config.
-    // Nếu bạn tải file index.html về máy cá nhân để chạy riêng qua Internet,
-    // hãy dán cấu hình Firebase Web App của bạn vào phần fallback bên dưới.
+    // Khi đưa lên mạng (GitHub Pages / Netlify), bạn chỉ cần dán đúng 3 dòng
+    // apiKey, authDomain, projectId vào bên dưới (hệ thống tự nhận diện, không cần sửa thêm cờ nào).
     let firebaseConfig = {
       apiKey: "AIzaSyAdc33anEGur9sEtCZcg8CECYGEDh_hdgs",
       authDomain: "classroom-live-game.firebaseapp.com",
       projectId: "classroom-live-game",
     };
-    let hasFirebaseConfig = true;
 
     try {
       if (typeof __firebase_config !== "undefined" && __firebase_config) {
-        firebaseConfig = JSON.parse(__firebase_config);
-        hasFirebaseConfig = Boolean(firebaseConfig && firebaseConfig.apiKey && firebaseConfig.projectId);
+        const envConfig = JSON.parse(__firebase_config);
+        if (envConfig && envConfig.apiKey && envConfig.projectId) {
+          firebaseConfig = envConfig;
+        }
       }
     } catch (err) {
       console.warn("Firebase config parse warning:", err);
     }
+
+    let hasFirebaseConfig = Boolean(
+      firebaseConfig &&
+      typeof firebaseConfig.apiKey === "string" &&
+      firebaseConfig.apiKey.trim().length > 5 &&
+      typeof firebaseConfig.projectId === "string" &&
+      firebaseConfig.projectId.trim().length > 1
+    );
 
     const appId = typeof __app_id !== "undefined" && __app_id ? __app_id : "dau-truong-tri-thuc-v1";
 
     let app = null;
     let auth = null;
     let db = null;
+    let firebaseInitError = null;
 
     if (hasFirebaseConfig) {
       try {
@@ -183,6 +199,7 @@
         db = getFirestore(app);
       } catch (err) {
         console.error("Firebase init failed:", err);
+        firebaseInitError = err;
         hasFirebaseConfig = false;
       }
     }
@@ -841,6 +858,9 @@
     const state = {
       user: null,
       authReady: false,
+      authError: null,
+      connStatus: "connecting", // connecting | online | offline | error
+      listenersStarted: false,
       teacherUnlocked: false,
       teacherPassword: "123456", // Synced with Firestore publicDoc("settings", "teacher_security")
       view: "home", // home | teacher_dashboard | teacher_lobby | teacher_game | teacher_summary | student_join | student_game
@@ -864,6 +884,7 @@
       studentAvatar: "boy1",
       studentSubmitting: false,
       lastRenderedStudentQKey: "",
+      lastPlayedFeedbackKey: "",
       studentMultiPicks: [],
       studentScramblePickedIdx: [],
 
@@ -877,6 +898,225 @@
     let unsubPlayers = null;
     let unsubAnswers = null;
     let timerInterval = null;
+
+    // ========================================================================
+    // 6B. CONNECTION DIAGNOSTICS & AUTO-RETRY AUTH HELPER
+    // ========================================================================
+    function translateFirebaseError(err) {
+      const code = String(err?.code || "").toLowerCase();
+      const msg = String(err?.message || "");
+      const host = window.location.hostname || "tên miền hiện tại";
+
+      if (code.includes("operation-not-allowed") || code.includes("admin-restricted-operation")) {
+        return "Chưa bật Đăng nhập Ẩn danh (Anonymous). Hãy vào Firebase Console → Authentication → Sign-in method → bật mục Anonymous rồi bấm Save.";
+      }
+      if (code.includes("unauthorized-domain")) {
+        return `Tên miền "${host}" chưa được cấp phép! Hãy vào Firebase Console → Authentication → Settings → Authorized domains → bấm Add domain và thêm "${host}".`;
+      }
+      if (code.includes("invalid-api-key") || code.includes("api-key-not-valid")) {
+        return "Mã apiKey trong tệp index.html bị sai hoặc thiếu ký tự. Hãy kiểm tra lại 3 dòng firebaseConfig.";
+      }
+      if (code.includes("network-request-failed") || msg.toLowerCase().includes("network")) {
+        return "Không kết nối được tới máy chủ Google Firebase. Hãy kiểm tra mạng Wi-Fi/4G hoặc thử TẮT khiên chặn quảng cáo trên trình duyệt điện thoại (hoặc mở bằng Chrome/Safari).";
+      }
+      if (code.includes("permission-denied") || code.includes("missing or insufficient permissions")) {
+        return "Cơ sở dữ liệu Firestore đang từ chối quyền đọc/ghi. Hãy vào Firebase Console → Firestore Database → thẻ Rules, dán đúng đoạn mã cấp quyền và bấm Publish.";
+      }
+      if (code.includes("unavailable")) {
+        return "Máy chủ tạm thời chưa phản hồi. Hãy kiểm tra kết nối mạng và thử bấm lại sau vài giây.";
+      }
+      return `Lỗi kết nối (${code || "unknown"}): ${msg || "Vui lòng kiểm tra cấu hình Firebase và kết nối Internet."}`;
+    }
+
+    function updateConnectionStatusUI() {
+      const btn = document.getElementById("btn-conn-status");
+      const dot = document.getElementById("conn-dot");
+      const label = document.getElementById("conn-label");
+      if (!btn || !dot || !label) return;
+
+      if (state.connStatus === "online") {
+        btn.className = "inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-emerald-100 hover:bg-emerald-200 text-emerald-900 font-extrabold text-xs border border-emerald-300 transition-all";
+        dot.className = "w-2.5 h-2.5 rounded-full bg-emerald-500";
+        label.textContent = "Trực tuyến";
+      } else if (state.connStatus === "connecting") {
+        btn.className = "inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-amber-100 hover:bg-amber-200 text-amber-900 font-extrabold text-xs border border-amber-300 transition-all";
+        dot.className = "w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse";
+        label.textContent = "Đang kết nối...";
+      } else {
+        btn.className = "inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-rose-100 hover:bg-rose-200 text-rose-800 font-extrabold text-xs border border-rose-300 transition-all";
+        dot.className = "w-2.5 h-2.5 rounded-full bg-rose-500 animate-ping";
+        label.textContent = "Lỗi kết nối";
+      }
+    }
+
+    function startGlobalFirestoreListeners() {
+      if (!db || !state.user || state.listenersStarted) return;
+      state.listenersStarted = true;
+
+      onSnapshot(
+        publicDoc("settings", "teacher_security"),
+        (snap) => {
+          if (snap.exists() && snap.data().password) {
+            state.teacherPassword = snap.data().password;
+          }
+        },
+        (err) => {
+          console.error("Security settings snapshot error:", err);
+          if (String(err?.code || "").includes("permission-denied")) {
+            state.authError = { code: err.code, message: translateFirebaseError(err) };
+            state.connStatus = "error";
+            updateConnectionStatusUI();
+          }
+        }
+      );
+
+      onSnapshot(
+        publicCol("question_sets"),
+        (snap) => {
+          const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          state.questionSets = list;
+          if (state.view === "teacher_dashboard" && !state.editingSet) renderCurrentView();
+        },
+        (err) => console.error("Question sets error:", err)
+      );
+
+      onSnapshot(
+        publicCol("match_history"),
+        (snap) => {
+          const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          list.sort((a, b) => (b.finishedAt || 0) - (a.finishedAt || 0));
+          state.matchHistory = list;
+          if (state.view === "teacher_dashboard" && state.teacherTab === "history") renderCurrentView();
+        },
+        (err) => console.error("Match history error:", err)
+      );
+    }
+
+    async function ensureAuth() {
+      if (!hasFirebaseConfig || !auth || !db) {
+        state.connStatus = "offline";
+        state.authError = {
+          code: firebaseInitError?.code || "missing-config",
+          message: firebaseInitError
+            ? translateFirebaseError(firebaseInitError)
+            : "Tệp index.html chưa có đủ mã cấu hình Firebase (apiKey, authDomain, projectId). Hãy kiểm tra lại mục firebaseConfig trong tệp index.html đã tải lên GitHub/Netlify.",
+        };
+        updateConnectionStatusUI();
+        return null;
+      }
+
+      if (auth.currentUser) {
+        state.user = auth.currentUser;
+        state.authError = null;
+        state.connStatus = "online";
+        updateConnectionStatusUI();
+        startGlobalFirestoreListeners();
+        return auth.currentUser;
+      }
+
+      state.connStatus = "connecting";
+      updateConnectionStatusUI();
+
+      try {
+        let cred;
+        if (typeof __initial_auth_token !== "undefined" && __initial_auth_token) {
+          cred = await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          cred = await signInAnonymously(auth);
+        }
+        state.user = cred.user || auth.currentUser;
+        state.authError = null;
+        state.connStatus = "online";
+        updateConnectionStatusUI();
+        startGlobalFirestoreListeners();
+        return state.user;
+      } catch (err) {
+        console.error("ensureAuth failed:", err);
+        state.authError = {
+          code: err?.code || "auth-failed",
+          message: translateFirebaseError(err),
+        };
+        state.connStatus = "error";
+        updateConnectionStatusUI();
+        return null;
+      }
+    }
+
+    function showConnectionDiagnosticModal() {
+      const root = document.getElementById("modal-root");
+      const host = window.location.hostname || "(Mở trực tiếp từ máy tính)";
+      const cfgOk = hasFirebaseConfig;
+      const authOk = Boolean(state.user);
+
+      root.innerHTML = `
+        <div class="bg-white rounded-3xl p-6 max-w-lg w-full shadow-2xl border-4 border-sky-200 space-y-4 animate-pop">
+          <div class="flex items-center justify-between">
+            <h3 class="text-xl font-black text-slate-900"><i class="fa-solid fa-wifi text-sky-600 mr-2"></i>Kiểm Tra Kết Nối Máy Chủ</h3>
+            <button id="diag-close" type="button" class="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 font-bold text-xs">Đóng</button>
+          </div>
+
+          <div class="space-y-2.5 text-sm">
+            <div class="p-3 rounded-2xl border ${cfgOk ? "bg-emerald-50 border-emerald-200" : "bg-rose-50 border-rose-200"} flex items-start gap-2.5">
+              <i class="fa-solid ${cfgOk ? "fa-circle-check text-emerald-600" : "fa-circle-xmark text-rose-600"} mt-0.5"></i>
+              <div>
+                <div class="font-black text-slate-900">1. Cấu hình Firebase trong index.html</div>
+                <div class="text-xs font-semibold text-slate-600">${cfgOk ? `Đã nhận dự án: ${escapeHtml(firebaseConfig.projectId)}` : "Chưa điền apiKey & projectId vào firebaseConfig."}</div>
+              </div>
+            </div>
+
+            <div class="p-3 rounded-2xl border ${authOk ? "bg-emerald-50 border-emerald-200" : "bg-rose-50 border-rose-200"} flex items-start gap-2.5">
+              <i class="fa-solid ${authOk ? "fa-circle-check text-emerald-600" : "fa-circle-xmark text-rose-600"} mt-0.5"></i>
+              <div>
+                <div class="font-black text-slate-900">2. Đăng nhập Ẩn danh (Anonymous Auth)</div>
+                <div class="text-xs font-semibold text-slate-600">${authOk ? `Đã kết nối (UID: ${escapeHtml(state.user.uid)})` : escapeHtml(state.authError?.message || "Chưa kết nối được phiên đăng nhập ẩn danh.")}</div>
+              </div>
+            </div>
+
+            <div class="p-3 rounded-2xl border bg-slate-50 border-slate-200 flex items-start gap-2.5">
+              <i class="fa-solid fa-globe text-sky-600 mt-0.5"></i>
+              <div>
+                <div class="font-black text-slate-900">3. Tên miền đang truy cập</div>
+                <div class="text-xs font-semibold text-slate-600">
+                  <span class="font-mono font-bold text-sky-800">${escapeHtml(host)}</span>
+                  <br/>Nếu gặp lỗi kết nối trên GitHub Pages/Netlify, hãy đảm bảo đã thêm tên miền này vào <b>Firebase → Authentication → Settings → Authorized domains</b>.
+                </div>
+              </div>
+            </div>
+
+            <div id="diag-db-result" class="hidden p-3 rounded-2xl border text-xs font-bold"></div>
+          </div>
+
+          <div class="flex flex-wrap justify-end gap-2 pt-2">
+            <button id="diag-retry" type="button" class="px-4 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-black text-sm shadow">
+              <i class="fa-solid fa-rotate mr-1.5"></i> Thử kết nối & Kiểm tra Firestore
+            </button>
+          </div>
+        </div>`;
+
+      root.classList.remove("hidden");
+      document.getElementById("diag-close").onclick = closeModal;
+      document.getElementById("diag-retry").onclick = async () => {
+        const resBox = document.getElementById("diag-db-result");
+        resBox.className = "p-3 rounded-2xl border bg-amber-50 border-amber-200 text-amber-900 text-xs font-bold";
+        resBox.textContent = "Đang kiểm tra kết nối Auth và Cloud Firestore...";
+        const u = await ensureAuth();
+        if (!u) {
+          resBox.className = "p-3 rounded-2xl border bg-rose-50 border-rose-200 text-rose-800 text-xs font-bold";
+          resBox.textContent = state.authError?.message || "Chưa thể kết nối Auth.";
+          return;
+        }
+        try {
+          await getDoc(publicDoc("settings", "teacher_security"));
+          resBox.className = "p-3 rounded-2xl border bg-emerald-50 border-emerald-200 text-emerald-800 text-xs font-bold";
+          resBox.textContent = "✅ Tuyệt vời! Kết nối Authentication và Cloud Firestore đều hoạt động 100%. Bạn có thể đóng hộp thoại và chơi ngay!";
+          renderCurrentView();
+        } catch (err) {
+          resBox.className = "p-3 rounded-2xl border bg-rose-50 border-rose-200 text-rose-800 text-xs font-bold";
+          resBox.textContent = translateFirebaseError(err);
+        }
+      };
+    }
 
     // ========================================================================
     // 7. MODALS (ALERT, CONFIRM, TEACHER AUTH, CHANGE PASS, INSPECT)
@@ -1269,8 +1509,9 @@
     }
 
     async function handleSaveQuestionSet(setObj) {
-      if (!db || !state.user) {
-        showAlert("Chưa kết nối máy chủ", "Ứng dụng cần kết nối Firebase để lưu bộ câu hỏi.");
+      const activeUser = await ensureAuth();
+      if (!db || !activeUser) {
+        showAlert("Chưa kết nối máy chủ", state.authError?.message || "Ứng dụng cần kết nối Firebase để lưu bộ câu hỏi.");
         return;
       }
       if (!setObj.title.trim()) {
@@ -1278,21 +1519,27 @@
         return;
       }
       sfx.click();
-      const id = setObj.id || `quiz_${Date.now()}`;
-      await setDoc(publicDoc("question_sets", id), {
-        ...setObj,
-        id,
-        createdBy: state.user.uid,
-        createdAt: setObj.createdAt || Date.now(),
-        updatedAt: Date.now(),
-      });
-      state.editingSet = null;
-      renderCurrentView();
+      try {
+        const id = setObj.id || `quiz_${Date.now()}`;
+        await setDoc(publicDoc("question_sets", id), {
+          ...setObj,
+          id,
+          createdBy: activeUser.uid,
+          createdAt: setObj.createdAt || Date.now(),
+          updatedAt: Date.now(),
+        });
+        state.editingSet = null;
+        renderCurrentView();
+      } catch (err) {
+        console.error("Save quiz error:", err);
+        showAlert("Không thể lưu bộ câu hỏi", translateFirebaseError(err));
+      }
     }
 
     async function handleCreateRoom(quiz) {
-      if (!db || !state.user) {
-        showAlert("Chưa kết nối máy chủ", "Vui lòng mở trong môi trường có kết nối máy chủ trực tuyến.");
+      const activeUser = await ensureAuth();
+      if (!db || !activeUser) {
+        showAlert("Chưa kết nối máy chủ", state.authError?.message || "Vui lòng kiểm tra kết nối máy chủ trực tuyến.");
         return;
       }
       if (!quiz.questions || quiz.questions.length === 0) {
@@ -1300,34 +1547,39 @@
         return;
       }
       sfx.click();
-      const pin = generateRoomPin();
-      state.activeQuiz = quiz;
-      state.revealTriggeredForQ = null;
+      try {
+        const pin = generateRoomPin();
+        state.activeQuiz = quiz;
+        state.revealTriggeredForQ = null;
 
-      await setDoc(publicDoc("rooms", pin), {
-        pin,
-        hostUid: state.user.uid,
-        status: "lobby",
-        isLocked: false,
-        theme: state.themeId,
-        quizId: quiz.id,
-        quizTitle: quiz.title,
-        subject: quiz.subject || "Tổng hợp",
-        totalQuestions: quiz.questions.length,
-        currentQuestionIndex: -1,
-        settings: quiz.settings || { basePoints: 500, speedBonus: 500, streakBonus: 100, defaultTime: 20 },
-        currentQuestionPublic: null,
-        revealedAnswer: null,
-        questionStartTime: null,
-        questionEndTime: null,
-        pausedRemainingMs: null,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      });
+        await setDoc(publicDoc("rooms", pin), {
+          pin,
+          hostUid: activeUser.uid,
+          status: "lobby",
+          isLocked: false,
+          theme: state.themeId,
+          quizId: quiz.id,
+          quizTitle: quiz.title,
+          subject: quiz.subject || "Tổng hợp",
+          totalQuestions: quiz.questions.length,
+          currentQuestionIndex: -1,
+          settings: quiz.settings || { basePoints: 500, speedBonus: 500, streakBonus: 100, defaultTime: 20 },
+          currentQuestionPublic: null,
+          revealedAnswer: null,
+          questionStartTime: null,
+          questionEndTime: null,
+          pausedRemainingMs: null,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        });
 
-      state.view = "teacher_lobby";
-      subscribeToRoom(pin);
-      renderCurrentView();
+        state.view = "teacher_lobby";
+        subscribeToRoom(pin);
+        renderCurrentView();
+      } catch (err) {
+        console.error("Create room error:", err);
+        showAlert("Không thể tạo phòng chơi", translateFirebaseError(err));
+      }
     }
 
     async function launchQuestion(index) {
@@ -1586,10 +1838,6 @@
     // ========================================================================
     async function handleStudentJoinSubmit(e) {
       e.preventDefault();
-      if (!db || !state.user) {
-        showAlert("Chưa kết nối máy chủ", "Vui lòng kiểm tra kết nối Internet để tham gia phòng chơi.");
-        return;
-      }
       const cleanPin = state.joinPin.trim();
       const cleanName = state.studentName.trim();
       const cleanClass = state.studentClass.trim();
@@ -1603,22 +1851,53 @@
         return;
       }
 
+      const submitBtn = document.getElementById("btn-student-join-submit");
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin mr-2"></i> ĐANG KẾT NỐI VÀO LỚP...`;
+      }
+
+      const activeUser = await ensureAuth();
+      if (!db || !activeUser) {
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.innerHTML = `THAM GIA TRÒ CHƠI <i class="fa-solid fa-play ml-2"></i>`;
+        }
+        showAlert(
+          "Không thể kết nối máy chủ",
+          state.authError?.message || "Vui lòng kiểm tra kết nối Internet hoặc bấm nút trạng thái kết nối ở góc trên để kiểm tra chi tiết."
+        );
+        return;
+      }
+
       sfx.click();
       try {
         const roomSnap = await getDoc(publicDoc("rooms", cleanPin));
         if (!roomSnap.exists()) {
-          showAlert("Không tìm thấy phòng", `Phòng chơi mã ${cleanPin} không tồn tại. Em hãy kiểm tra lại nhé!`);
+          if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = `THAM GIA TRÒ CHƠI <i class="fa-solid fa-play ml-2"></i>`;
+          }
+          showAlert("Không tìm thấy phòng", `Phòng chơi mã ${cleanPin} không tồn tại hoặc đã đóng. Em hãy kiểm tra lại mã PIN nhé!`);
           return;
         }
         const rData = roomSnap.data();
-        const playerRef = publicDoc("room_players", `${cleanPin}_${state.user.uid}`);
+        const playerRef = publicDoc("room_players", `${cleanPin}_${activeUser.uid}`);
         const existingPlayer = await getDoc(playerRef);
 
         if (rData.isLocked && !existingPlayer.exists()) {
+          if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = `THAM GIA TRÒ CHƠI <i class="fa-solid fa-play ml-2"></i>`;
+          }
           showAlert("Phòng đã khóa", "Giáo viên đã khóa phòng chơi này. Em hãy báo cho thầy/cô nhé!");
           return;
         }
         if (rData.status === "finished" && !existingPlayer.exists()) {
+          if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = `THAM GIA TRÒ CHƠI <i class="fa-solid fa-play ml-2"></i>`;
+          }
           showAlert("Trận đấu đã kết thúc", "Phòng chơi này đã hoàn thành trận đấu.");
           return;
         }
@@ -1626,7 +1905,7 @@
         if (!existingPlayer.exists()) {
           await setDoc(playerRef, {
             pin: cleanPin,
-            uid: state.user.uid,
+            uid: activeUser.uid,
             name: cleanName,
             className: cleanClass || "Tiểu học",
             avatarId: state.studentAvatar,
@@ -1649,12 +1928,23 @@
           });
         }
 
+        // Preserve PIN in URL so reloading the page reconnects seamlessly
+        try {
+          const url = new URL(window.location.href);
+          url.searchParams.set("pin", cleanPin);
+          window.history.replaceState({}, "", url.toString());
+        } catch {}
+
         state.view = "student_game";
         subscribeToRoom(cleanPin);
         renderCurrentView();
       } catch (err) {
-        console.error(err);
-        showAlert("Lỗi kết nối", "Không thể tham gia phòng lúc này. Em hãy thử lại nhé!");
+        console.error("Student join error:", err);
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.innerHTML = `THAM GIA TRÒ CHƠI <i class="fa-solid fa-play ml-2"></i>`;
+        }
+        showAlert("Lỗi tham gia phòng", translateFirebaseError(err));
       }
     }
 
@@ -3054,9 +3344,16 @@
               </div>
             </div>
 
-            <button type="submit" class="w-full py-4 rounded-2xl bg-gradient-to-r from-sky-500 to-blue-600 hover:from-sky-400 hover:to-blue-500 text-white font-black text-lg shadow-lg border-b-4 border-blue-800 active:border-b-0 active:translate-y-1 transition-all">
+            <button id="btn-student-join-submit" type="submit" class="w-full py-4 rounded-2xl bg-gradient-to-r from-sky-500 to-blue-600 hover:from-sky-400 hover:to-blue-500 disabled:opacity-60 text-white font-black text-lg shadow-lg border-b-4 border-blue-800 active:border-b-0 active:translate-y-1 transition-all">
               THAM GIA TRÒ CHƠI <i class="fa-solid fa-play ml-2"></i>
             </button>
+            ${
+              state.connStatus === "error" || state.connStatus === "offline"
+                ? `<div class="p-3 rounded-2xl bg-rose-50 border border-rose-200 text-rose-800 text-xs font-bold text-center">
+                     <i class="fa-solid fa-circle-exclamation mr-1"></i> ${escapeHtml(state.authError?.message || "Chưa kết nối được máy chủ.")}
+                   </div>`
+                : ""
+            }
           </form>
         </main>`;
 
@@ -3089,7 +3386,7 @@
       if (scoreEl && myPlayer) scoreEl.textContent = myPlayer.score || 0;
     }
 
-    function renderStudentGameView(root) {
+    function renderStudentGameView(root, forceRedraw = false) {
       const r = state.roomData;
       const theme = THEMES[state.themeId] || THEMES.classroom;
 
@@ -3109,19 +3406,36 @@
         ? state.roomAnswers.find((a) => a.uid === state.user?.uid && a.qIndex === r.currentQuestionIndex)
         : null;
 
+      // Play feedback sound once per revealed question or match finish on student device
+      if (r.status === "question_reveal" && myPlayer) {
+        const fbKey = `rev_${r.currentQuestionIndex}`;
+        if (state.lastPlayedFeedbackKey !== fbKey) {
+          state.lastPlayedFeedbackKey = fbKey;
+          if (myPlayer.lastResult === "correct") sfx.correct();
+          else sfx.wrong();
+        }
+      } else if (r.status === "finished") {
+        const fbKey = `fin_${state.currentPin}`;
+        if (state.lastPlayedFeedbackKey !== fbKey) {
+          state.lastPlayedFeedbackKey = fbKey;
+          sfx.victory();
+        }
+      }
+
       // Reset multi-select / scramble picks when question changes
       const qKey = `${r.status}_${r.currentQuestionIndex}_${myAns ? "ans" : "noans"}`;
       if (state.lastRenderedStudentQKey !== qKey) {
         state.studentMultiPicks = [];
         state.studentScramblePickedIdx = [];
       }
-      // Keep focus in short_answer text box while typing
+
+      // Prevent background updates from classmates from interrupting student typing/tapping on mobile
       if (
+        !forceRedraw &&
         r.status === "question_active" &&
-        r.currentQuestionPublic?.type === "short_answer" &&
         !myAns &&
         state.lastRenderedStudentQKey === qKey &&
-        document.getElementById("inp-short-ans")
+        document.getElementById("student-active-stage")
       ) {
         updateStudentHeaderOnly();
         return;
@@ -3291,7 +3605,7 @@
         }
 
         stageHtml = `
-          <div class="flex-1 flex flex-col gap-4">
+          <div id="student-active-stage" class="flex-1 flex flex-col gap-4">
             <div class="bg-white/95 rounded-2xl p-3 shadow border border-amber-200">
               <div class="flex items-center justify-between text-sm font-black mb-1.5">
                 <span class="text-amber-900">Câu ${r.currentQuestionIndex + 1} / ${r.totalQuestions}</span>
@@ -3410,7 +3724,7 @@
           } else {
             state.studentMultiPicks = [...state.studentMultiPicks, opt];
           }
-          renderStudentGameView(root);
+          renderStudentGameView(root, true);
         };
       });
       const btnSubmitMulti = document.getElementById("btn-submit-multi");
@@ -3428,7 +3742,7 @@
           const idx = Number(btn.getAttribute("data-pick-tile"));
           if (!state.studentScramblePickedIdx.includes(idx)) {
             state.studentScramblePickedIdx = [...state.studentScramblePickedIdx, idx];
-            renderStudentGameView(root);
+            renderStudentGameView(root, true);
           }
         };
       });
@@ -3437,7 +3751,7 @@
           sfx.click();
           const pos = Number(btn.getAttribute("data-unpick-pos"));
           state.studentScramblePickedIdx = state.studentScramblePickedIdx.filter((_, i) => i !== pos);
-          renderStudentGameView(root);
+          renderStudentGameView(root, true);
         };
       });
       const btnScrambleClear = document.getElementById("btn-scramble-clear");
@@ -3445,7 +3759,7 @@
         btnScrambleClear.onclick = () => {
           sfx.click();
           state.studentScramblePickedIdx = [];
-          renderStudentGameView(root);
+          renderStudentGameView(root, true);
         };
       }
       const btnSubmitScramble = document.getElementById("btn-submit-scramble");
@@ -3494,6 +3808,11 @@
       icon.className = sfx.muted ? "fa-solid fa-volume-xmark" : "fa-solid fa-volume-high";
     };
 
+    document.getElementById("btn-conn-status").onclick = () => {
+      sfx.click();
+      showConnectionDiagnosticModal();
+    };
+
     document.querySelectorAll(".theme-btn").forEach((btn) => {
       btn.onclick = async () => {
         sfx.click();
@@ -3519,72 +3838,62 @@
     // RULE 3: Authenticate FIRST before any Firestore listeners
     async function bootstrapApp() {
       if (!hasFirebaseConfig || !auth || !db) {
-        // Fallback so UI still renders cleanly if opened directly without Firebase config
         state.questionSets = JSON.parse(JSON.stringify(DEFAULT_QUESTION_SETS));
+        state.connStatus = "offline";
+        state.authError = {
+          code: "missing-config",
+          message: "Tệp index.html chưa được điền mã cấu hình Firebase (apiKey, authDomain, projectId).",
+        };
+        updateConnectionStatusUI();
         state.authReady = true;
         renderCurrentView();
         return;
       }
 
-      // Safety fallback timeout so screen never hangs blank
+      // Safety fallback timeout so screen never hangs blank on slow mobile networks
       const safetyTimer = setTimeout(() => {
         if (!state.authReady) {
           state.authReady = true;
           renderCurrentView();
         }
-      }, 3500);
+      }, 4500);
 
-      try {
-        if (typeof __initial_auth_token !== "undefined" && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-          await signInAnonymously(auth);
-        }
-      } catch (err) {
-        console.error("Auth init error:", err);
-      }
-
-      onAuthStateChanged(auth, (u) => {
-        clearTimeout(safetyTimer);
-        state.user = u;
-        state.authReady = true;
+      onAuthStateChanged(auth, async (u) => {
         if (u) {
-          // Sync custom teacher password from Firestore
-          onSnapshot(
-            publicDoc("settings", "teacher_security"),
-            (snap) => {
-              if (snap.exists() && snap.data().password) {
-                state.teacherPassword = snap.data().password;
+          clearTimeout(safetyTimer);
+          state.user = u;
+          state.authError = null;
+          state.connStatus = "online";
+          state.authReady = true;
+          updateConnectionStatusUI();
+          startGlobalFirestoreListeners();
+
+          // Seamless auto-rejoin if student reloaded the page with ?pin=XXXXXX
+          if (state.view === "student_join" && /^\d{6}$/.test(state.joinPin)) {
+            try {
+              const existingSnap = await getDoc(publicDoc("room_players", `${state.joinPin}_${u.uid}`));
+              if (existingSnap.exists()) {
+                const pData = existingSnap.data();
+                state.studentName = pData.name || state.studentName;
+                state.studentClass = pData.className || state.studentClass;
+                state.studentAvatar = pData.avatarId || state.studentAvatar;
+                state.view = "student_game";
+                subscribeToRoom(state.joinPin);
               }
-            },
-            (err) => console.error("Security settings snapshot error:", err)
-          );
-
-          // Subscribe to Question Sets & Match History
-          onSnapshot(
-            publicCol("question_sets"),
-            (snap) => {
-              const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-              list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-              state.questionSets = list;
-              if (state.view === "teacher_dashboard" && !state.editingSet) renderCurrentView();
-            },
-            (err) => console.error("Question sets error:", err)
-          );
-
-          onSnapshot(
-            publicCol("match_history"),
-            (snap) => {
-              const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-              list.sort((a, b) => (b.finishedAt || 0) - (a.finishedAt || 0));
-              state.matchHistory = list;
-              if (state.view === "teacher_dashboard" && state.teacherTab === "history") renderCurrentView();
-            },
-            (err) => console.error("Match history error:", err)
-          );
+            } catch (err) {
+              console.warn("Auto-rejoin check skipped:", err);
+            }
+          }
+          renderCurrentView();
         }
-        renderCurrentView();
       });
+
+      const activeUser = await ensureAuth();
+      clearTimeout(safetyTimer);
+      state.authReady = true;
+      if (!activeUser) {
+        renderCurrentView();
+      }
     }
 
     bootstrapApp();
