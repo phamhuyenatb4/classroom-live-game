@@ -551,6 +551,49 @@
         .replace(/'/g, "&#39;");
     }
 
+    function isImageSource(str) {
+      const s = String(str || "").trim();
+      return /^(https?:\/\/|data:image\/)/i.test(s);
+    }
+
+    function compressImageFile(file, maxDim = 480, quality = 0.72) {
+      return new Promise((resolve, reject) => {
+        if (!file || !file.type.startsWith("image/")) {
+          reject(new Error("Tệp chọn không phải là hình ảnh hợp lệ."));
+          return;
+        }
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error("Không thể đọc tệp hình ảnh."));
+        reader.onload = (e) => {
+          const img = new Image();
+          img.onerror = () => reject(new Error("Hình ảnh bị lỗi hoặc định dạng không hỗ trợ."));
+          img.onload = () => {
+            let { width, height } = img;
+            if (width > maxDim || height > maxDim) {
+              if (width >= height) {
+                height = Math.round((height * maxDim) / width);
+                width = maxDim;
+              } else {
+                width = Math.round((width * maxDim) / height);
+                height = maxDim;
+              }
+            }
+            const canvas = document.createElement("canvas");
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext("2d");
+            // Tô nền trắng để ảnh PNG trong suốt không bị nền đen khi nén JPEG
+            ctx.fillStyle = "#ffffff";
+            ctx.fillRect(0, 0, width, height);
+            ctx.drawImage(img, 0, 0, width, height);
+            resolve(canvas.toDataURL("image/jpeg", quality));
+          };
+          img.src = e.target.result;
+        };
+        reader.readAsDataURL(file);
+      });
+    }
+
     function generateRoomPin() {
       return String(Math.floor(100000 + Math.random() * 900000));
     }
@@ -625,7 +668,7 @@
       }
       if (type === "image_choice") {
         const { media, label } = parseImageChoiceOption(ansStr);
-        return media.startsWith("http") ? label || "Hình ảnh đã chọn" : `${media} ${label}`.trim();
+        return isImageSource(media) ? label || "Hình ảnh đã chọn" : `${media} ${label}`.trim();
       }
       return String(ansStr);
     }
@@ -1518,6 +1561,14 @@
         showAlert("Thiếu tên bộ câu hỏi", "Thầy/cô vui lòng nhập tên cho bộ câu hỏi nhé!");
         return;
       }
+      const approxBytes = new Blob([JSON.stringify(setObj)]).size;
+      if (approxBytes > 950000) {
+        showAlert(
+          "Bộ câu hỏi vượt giới hạn dung lượng",
+          `Tổng dung lượng hình ảnh hiện tại khoảng ${Math.round(approxBytes / 1024)} KB (tối đa 950 KB/bộ trên Firebase). Thầy/cô hãy bớt một vài hình ảnh hoặc chia thành 2 bộ câu hỏi nhỏ hơn nhé!`
+        );
+        return;
+      }
       sfx.click();
       try {
         const id = setObj.id || `quiz_${Date.now()}`;
@@ -1599,6 +1650,7 @@
         text: q.text,
         image: q.image || "",
         options: q.options || [],
+        optionImages: Array.isArray(q.optionImages) ? q.optionImages : [],
         scrambledLetters: q.type === "scramble" ? getScrambledLetters(q.correctAnswer, index + 1) : [],
         timeLimit,
       };
@@ -2304,7 +2356,7 @@
               subject: "Tổng hợp",
               settings: { basePoints: 500, speedBonus: 500, streakBonus: 100, defaultTime: 20 },
               questions: [
-                { id: `q_${Date.now()}`, type: "mcq4", text: "", image: "", options: ["", "", "", ""], correctAnswer: "", timeLimit: 20 },
+                { id: `q_${Date.now()}`, type: "mcq4", text: "", image: "", options: ["", "", "", ""], optionImages: ["", "", "", ""], correctAnswer: "", timeLimit: 20 },
               ],
             };
             renderCurrentView();
@@ -2479,10 +2531,41 @@
       }
     }
 
-    // --- QUIZ EDITOR SUB-RENDERER ---
+    // --- QUIZ EDITOR SUB-RENDERER (HỖ TRỢ CHÈN ẢNH CÂU HỎI & CÂU TRẢ LỜI) ---
     function renderQuizEditorHTML(form) {
       const qBlocks = form.questions
         .map((q, idx) => {
+          const optImgs = Array.isArray(q.optionImages) ? q.optionImages : [];
+          const hasQImg = isImageSource(q.image);
+
+          // Khu vực minh họa của câu hỏi
+          const qImageControl = hasQImg
+            ? `
+              <div class="flex items-center gap-3 p-2.5 rounded-xl bg-white border-2 border-indigo-200">
+                <img src="${escapeHtml(q.image)}" alt="Ảnh câu hỏi" class="h-16 w-20 object-contain rounded-lg bg-slate-50 border border-slate-200 p-0.5 shrink-0" />
+                <div class="flex-1 min-w-0">
+                  <div class="text-xs font-extrabold text-indigo-800">Đã chèn hình minh họa câu hỏi</div>
+                  <div class="flex flex-wrap gap-1.5 mt-1.5">
+                    <label class="cursor-pointer px-2.5 py-1 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold text-xs border border-indigo-200">
+                      <i class="fa-solid fa-arrows-rotate mr-1"></i>Đổi ảnh
+                      <input type="file" accept="image/*" data-q-img-file="${idx}" class="hidden" />
+                    </label>
+                    <button type="button" data-q-img-del="${idx}" class="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 font-bold text-xs border border-rose-200">
+                      <i class="fa-solid fa-trash-can mr-1"></i>Xóa ảnh
+                    </button>
+                  </div>
+                </div>
+              </div>`
+            : `
+              <div class="flex items-center gap-2">
+                <input data-q-img="${idx}" type="text" value="${escapeHtml(q.image || "")}" placeholder="Emoji (🍎) hoặc dán link ảnh..." class="flex-1 px-3 py-2 rounded-xl border border-slate-300 bg-white font-semibold text-sm" />
+                <label title="Tải hình ảnh minh họa từ máy tính" class="cursor-pointer px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-extrabold text-xs shadow-sm shrink-0 inline-flex items-center gap-1.5">
+                  <i class="fa-solid fa-image"></i> Tải ảnh
+                  <input type="file" accept="image/*" data-q-img-file="${idx}" class="hidden" />
+                </label>
+              </div>`;
+
+          // Khu vực phương án trả lời
           let optionsArea = "";
           if (q.type === "short_answer" || q.type === "scramble") {
             const labelHint =
@@ -2494,16 +2577,55 @@
                 <label class="block text-xs font-extrabold text-emerald-700 mb-1">${labelHint}</label>
                 <input data-q-correct="${idx}" type="text" value="${escapeHtml(q.correctAnswer)}" placeholder="Ví dụ: TWO" class="w-full sm:w-1/2 px-3.5 py-2 rounded-xl border-2 border-emerald-300 bg-emerald-50/50 font-black text-sm" />
               </div>`;
+          } else if (q.type === "image_choice") {
+            optionsArea = `
+              <p class="text-[11px] font-bold text-indigo-700 mb-1.5">
+                <i class="fa-solid fa-images mr-1"></i>Tải hình ảnh từ máy hoặc nhập Emoji cho từng đáp án, rồi bấm dấu tích để chọn đáp án đúng:
+              </p>
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                ${(q.options || [])
+                  .map((opt, optIdx) => {
+                    const { media, label } = parseImageChoiceOption(opt);
+                    const isCorrect = q.correctAnswer && q.correctAnswer === opt;
+                    const hasOptImg = isImageSource(media);
+                    const previewEl = hasOptImg
+                      ? `<img src="${escapeHtml(media)}" alt="Đáp án" class="h-14 w-16 object-contain rounded-lg bg-slate-50 border border-slate-200 p-0.5 shrink-0" />`
+                      : `<div class="h-14 w-16 rounded-lg bg-amber-50 border border-amber-200 flex items-center justify-center text-3xl shrink-0">${escapeHtml(media || "🖼️")}</div>`;
+
+                    return `
+                      <div class="p-2.5 rounded-2xl border-2 bg-white flex items-start gap-2.5 ${
+                        isCorrect ? "border-emerald-500 ring-2 ring-emerald-200" : "border-slate-200"
+                      }">
+                        <button type="button" data-q-mark-correct="${idx}:${optIdx}" title="Đánh dấu đáp án đúng" class="w-8 h-8 mt-1 rounded-xl flex items-center justify-center shrink-0 border-2 ${
+                          isCorrect ? "bg-emerald-500 border-emerald-600 text-white" : "bg-white border-slate-300 text-slate-400"
+                        }"><i class="fa-solid fa-check text-xs"></i></button>
+                        ${previewEl}
+                        <div class="flex-1 min-w-0 space-y-1.5">
+                          <input data-q-ic-label="${idx}:${optIdx}" type="text" value="${escapeHtml(label)}" placeholder="Tên gọi (VD: Con Voi)" class="w-full px-2.5 py-1.5 rounded-lg border border-slate-300 font-bold text-xs" />
+                          <div class="flex items-center gap-1.5">
+                            ${
+                              hasOptImg
+                                ? `<button type="button" data-q-ic-del="${idx}:${optIdx}" class="px-2 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 font-bold text-[11px] border border-rose-200"><i class="fa-solid fa-xmark mr-1"></i>Xóa ảnh</button>`
+                                : `<input data-q-ic-media="${idx}:${optIdx}" type="text" value="${escapeHtml(media)}" placeholder="Emoji / Link ảnh" class="flex-1 min-w-0 px-2 py-1 rounded-lg border border-slate-200 text-xs font-semibold" />`
+                            }
+                            <label class="cursor-pointer px-2.5 py-1 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold text-[11px] border border-indigo-200 shrink-0">
+                              <i class="fa-solid fa-upload mr-1"></i>Tải ảnh
+                              <input type="file" accept="image/*" data-q-ic-file="${idx}:${optIdx}" class="hidden" />
+                            </label>
+                          </div>
+                        </div>
+                      </div>`;
+                  })
+                  .join("")}
+              </div>`;
           } else {
             const selectedMultiSet = new Set(
               q.type === "multi_select" ? String(q.correctAnswer || "").split("||").filter(Boolean) : []
             );
             const helperNote =
-              q.type === "image_choice"
-                ? `<p class="text-[11px] font-bold text-indigo-700 mb-1.5"><i class="fa-solid fa-image mr-1"></i>Nhập theo dạng <b>Emoji|Tên gọi</b> hoặc <b>Link ảnh|Tên gọi</b> (Ví dụ: <code>🐘|Con Voi</code>)</p>`
-                : q.type === "multi_select"
-                ? `<p class="text-[11px] font-bold text-emerald-700 mb-1.5"><i class="fa-solid fa-list-check mr-1"></i>Bấm dấu tích để chọn <b>NHIỀU</b> đáp án đúng cùng lúc:</p>`
-                : "";
+              q.type === "multi_select"
+                ? `<p class="text-[11px] font-bold text-emerald-700 mb-1.5"><i class="fa-solid fa-list-check mr-1"></i>Bấm dấu tích để chọn <b>NHIỀU</b> đáp án đúng cùng lúc (có thể đính kèm hình minh họa cho từng đáp án):</p>`
+                : `<p class="text-[11px] font-bold text-slate-500 mb-1.5"><i class="fa-solid fa-circle-info mr-1"></i>Bấm dấu tích xanh để chọn đáp án đúng, bấm nút <b>🖼️</b> để chèn hình minh họa vào câu trả lời:</p>`;
 
             optionsArea = `
               ${helperNote}
@@ -2514,16 +2636,34 @@
                       q.type === "multi_select"
                         ? opt && selectedMultiSet.has(opt)
                         : q.correctAnswer && q.correctAnswer === opt;
-                    const ph =
-                      q.type === "image_choice"
-                        ? `Ví dụ: 🍎|Quả Táo`
-                        : `Phương án ${["A", "B", "C", "D"][optIdx]}`;
+                    const optImg = optImgs[optIdx] || "";
+                    const hasOptImg = isImageSource(optImg);
+                    const letter = ["A", "B", "C", "D"][optIdx] || optIdx + 1;
+
                     return `
-                      <div class="flex items-center gap-2">
-                        <button type="button" data-q-mark-correct="${idx}:${optIdx}" title="Đánh dấu đáp án đúng" class="w-8 h-8 rounded-xl flex items-center justify-center shrink-0 border-2 ${
-                          isCorrect ? "bg-emerald-500 border-emerald-600 text-white" : "bg-white border-slate-300 text-slate-400"
-                        }"><i class="fa-solid fa-check text-xs"></i></button>
-                        <input data-q-opt="${idx}:${optIdx}" type="text" value="${escapeHtml(opt)}" ${q.type === "true_false" ? "disabled" : ""} placeholder="${ph}" class="flex-1 px-3 py-2 rounded-xl border border-slate-300 bg-white font-bold text-sm" />
+                      <div class="p-2 rounded-2xl border bg-white space-y-2 ${isCorrect ? "border-emerald-400 bg-emerald-50/30" : "border-slate-200"}">
+                        <div class="flex items-center gap-2">
+                          <button type="button" data-q-mark-correct="${idx}:${optIdx}" title="Đánh dấu đáp án đúng" class="w-8 h-8 rounded-xl flex items-center justify-center shrink-0 border-2 ${
+                            isCorrect ? "bg-emerald-500 border-emerald-600 text-white" : "bg-white border-slate-300 text-slate-400"
+                          }"><i class="fa-solid fa-check text-xs"></i></button>
+                          <input data-q-opt="${idx}:${optIdx}" type="text" value="${escapeHtml(opt)}" ${q.type === "true_false" ? "disabled" : ""} placeholder="Phương án ${letter}" class="flex-1 min-w-0 px-3 py-2 rounded-xl border border-slate-300 bg-white font-bold text-sm" />
+                          <label title="Chèn hình minh họa cho phương án ${letter}" class="cursor-pointer w-9 h-9 rounded-xl flex items-center justify-center shrink-0 border transition-colors ${
+                            hasOptImg ? "bg-indigo-600 text-white border-indigo-700" : "bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border-indigo-200"
+                          }">
+                            <i class="fa-solid fa-image text-sm"></i>
+                            <input type="file" accept="image/*" data-q-opt-file="${idx}:${optIdx}" class="hidden" />
+                          </label>
+                        </div>
+                        ${
+                          hasOptImg
+                            ? `<div class="flex items-center gap-2 pl-10">
+                                 <img src="${escapeHtml(optImg)}" alt="Ảnh phương án ${letter}" class="h-14 w-20 object-contain rounded-lg border border-slate-200 bg-slate-50 p-0.5" />
+                                 <button type="button" data-q-opt-img-del="${idx}:${optIdx}" class="px-2 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 font-bold text-[11px] border border-rose-200">
+                                   <i class="fa-solid fa-trash-can mr-1"></i>Xóa ảnh
+                                 </button>
+                               </div>`
+                            : ""
+                        }
                       </div>`;
                   })
                   .join("")}
@@ -2554,14 +2694,12 @@
                   </button>
                 </div>
               </div>
-              <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
-                <div class="md:col-span-3">
-                  <input data-q-text="${idx}" type="text" value="${escapeHtml(q.text)}" placeholder="Nhập nội dung câu hỏi..." class="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white font-bold text-sm" />
-                </div>
-                <div>
-                  <input data-q-img="${idx}" type="text" value="${escapeHtml(q.image || "")}" placeholder="Emoji (🍎) hoặc link ảnh" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white font-semibold text-sm" />
-                </div>
+
+              <div class="space-y-2.5">
+                <input data-q-text="${idx}" type="text" value="${escapeHtml(q.text)}" placeholder="Nhập nội dung câu hỏi..." class="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 bg-white font-bold text-sm" />
+                ${qImageControl}
               </div>
+
               ${optionsArea}
             </div>`;
         })
@@ -2580,11 +2718,11 @@
           <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-3 bg-amber-50/70 p-4 rounded-2xl border border-amber-200">
             <div class="lg:col-span-2">
               <label class="block text-xs font-extrabold text-slate-600 mb-1">Tên bộ câu hỏi</label>
-              <input id="ed-title" type="text" value="${escapeHtml(form.title)}" placeholder="Ví dụ: Ôn tập Toán lớp 4 - Tuần 10" class="w-full px-3 py-2 rounded-xl border border-slate-300 font-bold text-sm" />
+              <input id="ed-title" type="text" value="${escapeHtml(form.title)}" placeholder="Ví dụ: Ôn tập Tin học lớp 4 - Tuần 10" class="w-full px-3 py-2 rounded-xl border border-slate-300 font-bold text-sm" />
             </div>
             <div>
               <label class="block text-xs font-extrabold text-slate-600 mb-1">Môn học</label>
-              <input id="ed-subject" type="text" value="${escapeHtml(form.subject)}" placeholder="Toán / Tiếng Anh" class="w-full px-3 py-2 rounded-xl border border-slate-300 font-bold text-sm" />
+              <input id="ed-subject" type="text" value="${escapeHtml(form.subject)}" placeholder="Tin học / Toán" class="w-full px-3 py-2 rounded-xl border border-slate-300 font-bold text-sm" />
             </div>
             <div>
               <label class="block text-xs font-extrabold text-slate-600 mb-1">Điểm gốc / Thưởng nhanh</label>
@@ -2630,6 +2768,7 @@
           text: "",
           image: "",
           options: ["", "", "", ""],
+          optionImages: ["", "", "", ""],
           correctAnswer: "",
           timeLimit: form.settings?.defaultTime || 20,
         });
@@ -2643,15 +2782,19 @@
           form.questions[idx].type = newType;
           if (newType === "true_false") {
             form.questions[idx].options = ["Đúng", "Sai"];
+            form.questions[idx].optionImages = ["", ""];
             form.questions[idx].correctAnswer = "Đúng";
           } else if (newType === "mcq3") {
             form.questions[idx].options = ["", "", ""];
+            form.questions[idx].optionImages = ["", "", ""];
             form.questions[idx].correctAnswer = "";
           } else if (["mcq4", "image_choice", "multi_select"].includes(newType)) {
             form.questions[idx].options = newType === "image_choice" ? ["🍎|Táo", "🍌|Chuối", "🍊|Cam", "🍇|Nho"] : ["", "", "", ""];
+            form.questions[idx].optionImages = ["", "", "", ""];
             form.questions[idx].correctAnswer = "";
           } else {
             form.questions[idx].options = [];
+            form.questions[idx].optionImages = [];
             form.questions[idx].correctAnswer = "";
           }
           redrawEditor();
@@ -2674,9 +2817,37 @@
       document.querySelectorAll("[data-q-img]").forEach((inp) => {
         inp.oninput = (e) => (form.questions[Number(inp.getAttribute("data-q-img"))].image = e.target.value);
       });
+
+      // Tải ảnh minh họa câu hỏi từ máy tính
+      document.querySelectorAll("[data-q-img-file]").forEach((inp) => {
+        inp.onchange = async (e) => {
+          const file = e.target.files?.[0];
+          if (!file) return;
+          const idx = Number(inp.getAttribute("data-q-img-file"));
+          try {
+            form.questions[idx].image = await compressImageFile(file, 480, 0.72);
+            sfx.click();
+            redrawEditor();
+          } catch (err) {
+            showAlert("Lỗi tải hình ảnh", err.message);
+          } finally {
+            e.target.value = "";
+          }
+        };
+      });
+      document.querySelectorAll("[data-q-img-del]").forEach((btn) => {
+        btn.onclick = () => {
+          const idx = Number(btn.getAttribute("data-q-img-del"));
+          form.questions[idx].image = "";
+          redrawEditor();
+        };
+      });
+
       document.querySelectorAll("[data-q-correct]").forEach((inp) => {
         inp.oninput = (e) => (form.questions[Number(inp.getAttribute("data-q-correct"))].correctAnswer = e.target.value);
       });
+
+      // Cập nhật chữ của đáp án (mcq4, mcq3, multi_select, true_false)
       document.querySelectorAll("[data-q-opt]").forEach((inp) => {
         inp.oninput = (e) => {
           const [qi, oi] = inp.getAttribute("data-q-opt").split(":").map(Number);
@@ -2695,6 +2866,88 @@
           }
         };
       });
+
+      // Tải / xóa ảnh minh họa cho từng phương án trả lời (mcq4, mcq3, multi_select, true_false)
+      document.querySelectorAll("[data-q-opt-file]").forEach((inp) => {
+        inp.onchange = async (e) => {
+          const file = e.target.files?.[0];
+          if (!file) return;
+          const [qi, oi] = inp.getAttribute("data-q-opt-file").split(":").map(Number);
+          const q = form.questions[qi];
+          try {
+            if (!Array.isArray(q.optionImages)) q.optionImages = (q.options || []).map(() => "");
+            q.optionImages[oi] = await compressImageFile(file, 240, 0.7);
+            // Tự động gán nhãn nếu ô chữ đang trống để giáo viên chọn được đáp án đúng
+            if (!String(q.options[oi] || "").trim()) {
+              q.options[oi] = `Hình ${["A", "B", "C", "D"][oi] || oi + 1}`;
+            }
+            sfx.click();
+            redrawEditor();
+          } catch (err) {
+            showAlert("Lỗi tải hình ảnh đáp án", err.message);
+          } finally {
+            e.target.value = "";
+          }
+        };
+      });
+      document.querySelectorAll("[data-q-opt-img-del]").forEach((btn) => {
+        btn.onclick = () => {
+          const [qi, oi] = btn.getAttribute("data-q-opt-img-del").split(":").map(Number);
+          const q = form.questions[qi];
+          if (Array.isArray(q.optionImages)) q.optionImages[oi] = "";
+          redrawEditor();
+        };
+      });
+
+      // Cập nhật ảnh & tên gọi cho dạng câu hỏi Chọn hình ảnh (image_choice)
+      const updateImageChoiceOpt = (qi, oi, newMedia, newLabel) => {
+        const q = form.questions[qi];
+        const oldVal = q.options[oi];
+        const nextVal = `${newMedia}|${newLabel}`;
+        q.options[oi] = nextVal;
+        if (q.correctAnswer === oldVal) q.correctAnswer = nextVal;
+      };
+      document.querySelectorAll("[data-q-ic-label]").forEach((inp) => {
+        inp.oninput = (e) => {
+          const [qi, oi] = inp.getAttribute("data-q-ic-label").split(":").map(Number);
+          const { media } = parseImageChoiceOption(form.questions[qi].options[oi]);
+          updateImageChoiceOpt(qi, oi, media, e.target.value);
+        };
+      });
+      document.querySelectorAll("[data-q-ic-media]").forEach((inp) => {
+        inp.oninput = (e) => {
+          const [qi, oi] = inp.getAttribute("data-q-ic-media").split(":").map(Number);
+          const { label } = parseImageChoiceOption(form.questions[qi].options[oi]);
+          updateImageChoiceOpt(qi, oi, e.target.value, label);
+        };
+      });
+      document.querySelectorAll("[data-q-ic-file]").forEach((inp) => {
+        inp.onchange = async (e) => {
+          const file = e.target.files?.[0];
+          if (!file) return;
+          const [qi, oi] = inp.getAttribute("data-q-ic-file").split(":").map(Number);
+          try {
+            const dataUrl = await compressImageFile(file, 260, 0.72);
+            const { label } = parseImageChoiceOption(form.questions[qi].options[oi]);
+            updateImageChoiceOpt(qi, oi, dataUrl, label || `Hình ${["A", "B", "C", "D"][oi] || oi + 1}`);
+            sfx.click();
+            redrawEditor();
+          } catch (err) {
+            showAlert("Lỗi tải hình ảnh", err.message);
+          } finally {
+            e.target.value = "";
+          }
+        };
+      });
+      document.querySelectorAll("[data-q-ic-del]").forEach((btn) => {
+        btn.onclick = () => {
+          const [qi, oi] = btn.getAttribute("data-q-ic-del").split(":").map(Number);
+          const { label } = parseImageChoiceOption(form.questions[qi].options[oi]);
+          updateImageChoiceOpt(qi, oi, "", label);
+          redrawEditor();
+        };
+      });
+
       document.querySelectorAll("[data-q-mark-correct]").forEach((btn) => {
         btn.onclick = () => {
           const [qi, oi] = btn.getAttribute("data-q-mark-correct").split(":").map(Number);
@@ -2850,8 +3103,8 @@
       // Media Illustration on Chalkboard
       let mediaHtml = "";
       if (qPub.image) {
-        mediaHtml = qPub.image.startsWith("http")
-          ? `<img src="${escapeHtml(qPub.image)}" onerror="this.style.display='none'" alt="Minh họa" class="max-h-28 rounded-xl border-2 border-white/30 shadow mx-auto" />`
+        mediaHtml = isImageSource(qPub.image)
+          ? `<img src="${escapeHtml(qPub.image)}" onerror="this.style.display='none'" alt="Minh họa" class="max-h-36 rounded-xl border-2 border-white/40 bg-white/95 p-1 shadow mx-auto object-contain" />`
           : `<div class="text-5xl leading-none">${escapeHtml(qPub.image)}</div>`;
       }
 
@@ -2886,8 +3139,8 @@
                 const { media, label } = parseImageChoiceOption(opt);
                 const isCorrect = r.status === "question_reveal" && normalizeAnswer(opt) === normalizeAnswer(r.revealedAnswer?.correctAnswer);
                 const isDimmed = r.status === "question_reveal" && !isCorrect;
-                const mediaEl = media.startsWith("http")
-                  ? `<img src="${escapeHtml(media)}" onerror="this.src='https://placehold.co/64x64/e2e8f0/475569?text=IMG'" alt="${escapeHtml(label)}" class="h-14 w-14 object-cover rounded-xl mx-auto" />`
+                const mediaEl = isImageSource(media)
+                  ? `<img src="${escapeHtml(media)}" onerror="this.src='https://placehold.co/64x64/e2e8f0/475569?text=IMG'" alt="${escapeHtml(label)}" class="h-16 w-20 object-contain bg-white/95 p-1 rounded-xl mx-auto" />`
                   : `<div class="text-4xl leading-none">${escapeHtml(media)}</div>`;
                 return `
                   <div class="flex flex-col items-center justify-center gap-1 p-2.5 rounded-2xl font-bold text-xs sm:text-sm transition-all ${
@@ -2920,6 +3173,10 @@
                     ? correctMultiSet.has(normalizeAnswer(opt))
                     : normalizeAnswer(opt) === normalizeAnswer(r.revealedAnswer?.correctAnswer));
                 const isDimmed = r.status === "question_reveal" && !isCorrect;
+                const optImg = qPub.optionImages?.[idx] || "";
+                const optImgEl = isImageSource(optImg)
+                  ? `<img src="${escapeHtml(optImg)}" alt="Minh họa ${letter}" class="h-12 w-14 object-contain bg-white rounded-lg p-0.5 shrink-0 shadow-sm" />`
+                  : "";
                 return `
                   <div class="flex items-center gap-3 px-4 py-2.5 rounded-2xl font-bold text-sm sm:text-base transition-all ${
                     isCorrect ? "bg-emerald-400 text-emerald-950 ring-4 ring-white shadow-lg scale-[1.02]"
@@ -2929,6 +3186,7 @@
                     <span class="w-7 h-7 rounded-lg flex items-center justify-center font-black text-sm shrink-0 ${
                       isCorrect ? "bg-emerald-900 text-white" : "bg-amber-400 text-amber-950"
                     }">${letter}</span>
+                    ${optImgEl}
                     <span class="truncate">${escapeHtml(opt)}</span>
                     ${isCorrect ? `<i class="fa-solid fa-circle-check ml-auto text-lg"></i>` : ""}
                   </div>`;
@@ -3460,8 +3718,8 @@
         const qPub = r.currentQuestionPublic;
         const pct = Math.min(100, (state.remainingSec / (qPub.timeLimit || 20)) * 100);
         const mediaHtml = qPub.image
-          ? qPub.image.startsWith("http")
-            ? `<img src="${escapeHtml(qPub.image)}" onerror="this.style.display='none'" alt="Minh họa" class="max-h-36 rounded-2xl shadow mx-auto" />`
+          ? isImageSource(qPub.image)
+            ? `<img src="${escapeHtml(qPub.image)}" onerror="this.style.display='none'" alt="Minh họa" class="max-h-40 rounded-2xl shadow bg-white p-1 mx-auto object-contain" />`
             : `<div class="text-5xl">${escapeHtml(qPub.image)}</div>`
           : "";
 
@@ -3544,8 +3802,8 @@
               ${(qPub.options || [])
                 .map((opt, idx) => {
                   const { media, label } = parseImageChoiceOption(opt);
-                  const mediaEl = media.startsWith("http")
-                    ? `<img src="${escapeHtml(media)}" onerror="this.src='https://placehold.co/96x96/e2e8f0/475569?text=IMG'" alt="${escapeHtml(label)}" class="h-24 w-24 object-cover rounded-2xl shadow" />`
+                  const mediaEl = isImageSource(media)
+                    ? `<img src="${escapeHtml(media)}" onerror="this.src='https://placehold.co/96x96/e2e8f0/475569?text=IMG'" alt="${escapeHtml(label)}" class="h-24 w-28 object-contain bg-white p-1 rounded-2xl shadow" />`
                     : `<div class="text-6xl">${escapeHtml(media)}</div>`;
                   return `
                     <button type="button" data-pick-opt="${idx}" class="p-4 rounded-3xl border-4 shadow-lg active:scale-95 transition-all flex flex-col items-center justify-center gap-2 ${cardColors[idx % 4]}">
@@ -3565,8 +3823,12 @@
                 ${(qPub.options || [])
                   .map((opt, idx) => {
                     const checked = state.studentMultiPicks.includes(opt);
+                    const optImg = qPub.optionImages?.[idx] || "";
+                    const optImgEl = isImageSource(optImg)
+                      ? `<img src="${escapeHtml(optImg)}" alt="" class="h-16 w-20 object-contain bg-white rounded-xl p-1 shrink-0 shadow" />`
+                      : "";
                     return `
-                      <button type="button" data-toggle-multi="${idx}" class="min-h-[76px] p-4 rounded-3xl font-black text-lg shadow-md border-4 transition-all flex items-center gap-3 text-left ${
+                      <button type="button" data-toggle-multi="${idx}" class="min-h-[76px] p-3.5 rounded-3xl font-black text-lg shadow-md border-4 transition-all flex items-center gap-3 text-left ${
                         checked
                           ? "bg-indigo-600 text-white border-indigo-900 scale-[1.02]"
                           : "bg-white text-slate-800 border-slate-300 hover:border-indigo-400"
@@ -3574,6 +3836,7 @@
                         <span class="w-9 h-9 rounded-xl flex items-center justify-center shrink-0 border-2 ${
                           checked ? "bg-white text-indigo-700 border-white" : "bg-slate-100 text-slate-400 border-slate-300"
                         }"><i class="fa-solid ${checked ? "fa-check" : "fa-square"}"></i></span>
+                        ${optImgEl}
                         <span class="leading-tight">${escapeHtml(opt)}</span>
                       </button>`;
                   })
@@ -3593,13 +3856,18 @@
           interactionHtml = `
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4 flex-1">
               ${(qPub.options || [])
-                .map(
-                  (opt, idx) => `
+                .map((opt, idx) => {
+                  const optImg = qPub.optionImages?.[idx] || "";
+                  const optImgEl = isImageSource(optImg)
+                    ? `<img src="${escapeHtml(optImg)}" alt="" class="h-20 w-24 object-contain bg-white rounded-xl p-1 shrink-0 shadow" />`
+                    : "";
+                  return `
                   <button type="button" data-pick-opt="${idx}" class="min-h-[84px] p-4 rounded-3xl text-white font-black text-lg sm:text-xl shadow-lg border-b-[6px] active:border-b-0 active:translate-y-1.5 transition-all flex items-center gap-3 text-left ${colors[idx % 4]}">
                     <span class="w-11 h-11 rounded-2xl bg-white/25 flex items-center justify-center text-2xl shrink-0">${["A", "B", "C", "D"][idx] || idx + 1}</span>
+                    ${optImgEl}
                     <span class="leading-tight">${escapeHtml(opt)}</span>
-                  </button>`
-                )
+                  </button>`;
+                })
                 .join("")}
             </div>`;
         }
